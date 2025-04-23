@@ -37,6 +37,14 @@ except ImportError:
     print("Error: requests library not found. Please install with 'pip install requests'")
     exit(1)
 
+# --- NEW: Import kneed ---
+try:
+    from kneed import KneeLocator
+except ImportError:
+    print("Error: kneed library not found. Please install with 'pip install kneed'")
+    exit(1)
+# --- End NEW ---
+
 # --- LLM Client Imports ---
 # Store imported clients to avoid repeated imports
 _llm_clients = {}
@@ -122,11 +130,12 @@ except (ValueError, TypeError):
 # --- NEW: Re-initialization and Sampling Control ---
 ENABLE_CLIENT_REINIT = True # Set to False to disable periodic re-initialization
 CLIENT_REINIT_INTERVAL = 100 # Re-initialize client every N collections if enabled
-MAX_COLLECTIONS = 250 # Max collections to search (0 = search all). Randomly samples if > 0 and < total valid collections.
+MAX_COLLECTIONS = 100 # Max collections to search (0 = search all). Randomly samples if > 0 and < total valid collections. # Changed to 100
+MAX_PIPELINE_ATTEMPTS = 5 # Max attempts for the entire generation pipeline (sampling -> LLM calls)
 
 # --- Prompts (Customize these heavily!) ---
 CONTEXT_VALIDATION_SYSTEM_PROMPT = "You are an expert Crusader Kings III game designer."
-CONTEXT_VALIDATION_PROMPT_TEMPLATE = """Analyze the following Crusader Kings III script excerpts. Determine if the provided script context contains meaningful information about a game mechanic or serves as a valuable example for designers.
+CONTEXT_VALIDATION_PROMPT_TEMPLATE = """Analyze the following Crusader Kings III script excerpts. Determine if the provided script context contains meaningful information about a game mechanic or potentially serves as a valuable example for designers.
 
 Respond with ONLY one of the following assessments:
 - "Sufficient"
@@ -141,7 +150,7 @@ Script Context:
 
 Assessment:"""
 
-INTERPRETATION_SYSTEM_PROMPT = "You are an expert Crusader Kings III game designer. Your task is to interpret game script and explain the resulting game mechanics in clear, natural language."
+INTERPRETATION_SYSTEM_PROMPT = "You are an expert Crusader Kings III game designer. Your task is to interpret game script and explain the game mechanics they result in in clear, natural language."
 INTERPRETATION_PROMPT_TEMPLATE = """Based *only* on the following Crusader Kings III script excerpts, explain the game mechanic, event, interaction, or definition they represent in clear, natural language suitable for someone learning about the game. Focus on what the player would observe or experience.
 
 Script Context:
@@ -180,6 +189,8 @@ Review Assessment:"""
 
 QA_GENERATION_SYSTEM_PROMPT = "You are tasked with creating high-quality training data for a Crusader Kings III expert AI."
 QA_GENERATION_PROMPT_TEMPLATE = """Based *only* on the provided natural language explanation of a Crusader Kings III mechanic, generate one relevant question a player might ask and a comprehensive, accurate answer derived strictly from the explanation.
+
+**Important:** The answer should directly address the question without using introductory phrases like "Based on the explanation..." or "According to the text...".
 
 Format the output as a JSON object with keys "question" and "answer".
 
@@ -235,8 +246,10 @@ parser.add_argument("--openai-key", default=DEFAULT_OPENAI_API_KEY, help="OpenAI
 parser.add_argument("--openai-base", default=DEFAULT_OPENAI_API_BASE, help="OpenAI API Base URL.")
 parser.add_argument("--gemini-key", default=DEFAULT_GEMINI_API_KEY, help="Google Gemini API Key.")
 # --- Updated Chunk Count Arguments ---
-parser.add_argument("--num-results-per-coll", type=int, default=2, help="Max number of chunks to retrieve *per collection* during search.") # Default 2
-parser.add_argument("--max-context-docs", type=int, default=10, help="Max number of unique document chunks to include in the final context (total).") # Default 10
+parser.add_argument("--num-results-per-coll", type=int, default=3, help="Max number of chunks to retrieve *per collection* during search.") # Changed to 3
+parser.add_argument("--max-context-docs", type=int, default=50, help="Max number of unique document chunks to aim for in the final context (total).") # Default 50
+# --- REMOVED: Distance Threshold Argument ---
+# parser.add_argument("--max-distance-threshold", type=float, default=1.0, help="Maximum distance (lower is more similar) for chunks to be included in the context.")
 # --- End Updated Chunk Count Arguments ---
 parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Max retries for LLM calls.")
 parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging.")
@@ -526,11 +539,12 @@ def main():
     print(f"Value for --webui-db-path: '{args.webui_db_path}' (Type: {type(args.webui_db_path)})") # Added
     print(f"Value for --tag-name: '{args.tag_name}' (Type: {type(args.tag_name)})") # Added
     print(f"Value for --embed-model: '{args.embed_model}' (Type: {type(args.embed_model)})")
-    print(f"Value for --llm-provider: '{args.llm_provider}' (Type: {type(args.llm_provider)})")
-    print(f"Value for --llm-model: '{args.llm_model}' (Type: {type(args.llm_model)})")
+    print(f"Value for --llm-provider: {args.llm_provider} (Type: {type(args.llm_provider)})")
+    print(f"Value for --llm-model: {args.llm_model} (Type: {type(args.llm_model)})")
     # --- Updated Debug Output ---
-    print(f"Value for --num-results-per-coll: {args.num_results_per_coll} (Type: {type(args.num_results_per_coll)})")
+    print(f"Value for --num-results-per-coll: {args.num_results_per_coll} (Type: {type(args.num_results_per_coll)})") # Updated default
     print(f"Value for --max-context-docs: {args.max_context_docs} (Type: {type(args.max_context_docs)})")
+    # print(f"Value for --max-distance-threshold: {args.max_distance_threshold} (Type: {type(args.max_distance_threshold)})") # Removed
     # --- End Updated Debug Output ---
     print(f"Value for --max-retries: {args.max_retries} (Type: {type(args.max_retries)})")
     print("-----------------------------")
@@ -579,293 +593,295 @@ def main():
         print(f"Error listing or filtering ChromaDB collections: {e}")
         exit(1)
 
-    # 2. Get a Random Starting Point from a Random *Valid* Collection (with Retries for Emptiness)
-    core_id = None
-    core_doc = None
-    core_meta = None
-    selected_collection_name = None
-    MAX_START_DOC_ATTEMPTS = 10 # Try up to 10 times to find a non-empty valid collection
-    attempts = 0
-    # Use a copy of the list for attempts, so we can remove items without affecting the main search list
-    attempt_collection_list = valid_collection_names.copy()
+    # --- Outer Pipeline Retry Loop ---
+    pipeline_attempt = 0
+    success = False # Flag to track if we succeeded
+    while pipeline_attempt < MAX_PIPELINE_ATTEMPTS:
+        pipeline_attempt += 1
+        print(f"\n--- Starting Pipeline Attempt {pipeline_attempt}/{MAX_PIPELINE_ATTEMPTS} ---")
 
-    log_verbose(f"Attempting to select a random starting document from {len(attempt_collection_list)} valid collections (max {MAX_START_DOC_ATTEMPTS} attempts)...")
-    while attempts < MAX_START_DOC_ATTEMPTS:
-        attempts += 1
-        log_verbose(f"Attempt {attempts}/{MAX_START_DOC_ATTEMPTS}...")
-        try:
-            if not attempt_collection_list: # Check if the attempt list is exhausted
-                 print("Error: Ran out of valid collections to attempt for starting document.")
-                 break # Exit the while loop, will hit the error check below
-
-            random_collection_name = random.choice(attempt_collection_list)
-            log_verbose(f"Trying collection: {random_collection_name}")
-
-            # Collection should exist, but we still need try-except for safety
-            try:
-                 collection = client.get_collection(name=random_collection_name, embedding_function=st_ef)
-            except Exception as e:
-                 # This shouldn't happen now, but handle defensively
-                 print(f"Warning: Validated collection '{random_collection_name}' unexpectedly failed to load: {e}. Removing from attempts.")
-                 attempt_collection_list.remove(random_collection_name)
-                 continue # Go to the next attempt
-
-            # Fetch a small number of documents (e.g., 10) to find a starting chunk
-            results = collection.get(limit=10, include=['documents', 'metadatas'])
-            if not results or not results.get('ids'):
-                log_verbose(f"Warning: Collection {random_collection_name} exists but appears empty or failed to get documents. Removing from attempts.")
-                attempt_collection_list.remove(random_collection_name)
-                continue # Go to the next attempt
-
-            # Successfully found a non-empty, existing collection
-            random_index = random.choice(range(len(results['ids'])))
-            core_id = results['ids'][random_index]
-            core_doc = results['documents'][random_index]
-            core_meta = results['metadatas'][random_index] if results['metadatas'] else {}
-            selected_collection_name = random_collection_name # Store the name of the valid collection
-            log_verbose(f"Selected core document ID: {core_id} from collection {selected_collection_name} (Source File: {core_meta.get('filename', 'N/A')})")
-            log_verbose(f"Core document content (start): {core_doc[:200]}...")
-            break # Exit the while loop successfully
-
-        except Exception as e:
-            # Catch any other unexpected errors during selection
-            print(f"Unexpected error during starting document selection (Attempt {attempts}): {e}")
-            # Remove the collection that caused the error to avoid retrying it
-            if random_collection_name in attempt_collection_list:
-                 attempt_collection_list.remove(random_collection_name)
-            time.sleep(1) # Small delay before retrying
-            continue
-
-    # Check if we successfully found a starting document after all attempts
-    if not core_doc:
-        print(f"Error: Failed to find a valid, non-empty starting document after {MAX_START_DOC_ATTEMPTS} attempts from {len(valid_collection_names)} valid collections.")
-        print("This might indicate that all valid collections are empty or encountered errors during loading.")
-        exit(1)
-
-    # 3. Semantic Context Retrieval (Maintain Running Top-N with Optional Sampling and Re-init)
-    top_results_heap = [] # Using a min-heap (inverted distance for max-heap behavior)
-    processed_doc_hashes = {hash(core_doc)} # Keep track of unique docs added
-
-    try:
-        # --- Collection Sampling ---
-        collections_to_search = valid_collection_names # Start with the full list
+        # --- Collection Sampling (Inside Loop) ---
+        collections_to_search = valid_collection_names # Start with the full list for sampling
         total_valid_collections = len(valid_collection_names)
+        sampled_collections_for_this_attempt = []
 
         if MAX_COLLECTIONS > 0 and MAX_COLLECTIONS < total_valid_collections:
-            log_verbose(f"MAX_COLLECTIONS set to {MAX_COLLECTIONS}. Randomly sampling from {total_valid_collections} valid collections.")
-            collections_to_search = random.sample(valid_collection_names, MAX_COLLECTIONS)
-            log_verbose(f"Will search {len(collections_to_search)} randomly selected collections.")
+            log_verbose(f"MAX_COLLECTIONS set to {MAX_COLLECTIONS}. Randomly sampling from {total_valid_collections} valid collections for attempt {pipeline_attempt}.")
+            sampled_collections_for_this_attempt = random.sample(valid_collection_names, MAX_COLLECTIONS)
+            log_verbose(f"Will search {len(sampled_collections_for_this_attempt)} randomly selected collections this attempt.")
         elif MAX_COLLECTIONS > 0:
             log_verbose(f"MAX_COLLECTIONS ({MAX_COLLECTIONS}) is >= total valid collections ({total_valid_collections}). Searching all valid collections.")
+            sampled_collections_for_this_attempt = valid_collection_names # Use all
         else:
             log_verbose("MAX_COLLECTIONS is 0. Searching all valid collections.")
+            sampled_collections_for_this_attempt = valid_collection_names # Use all
         # --- End Collection Sampling ---
 
-        total_collections_to_search = len(collections_to_search) # Use the length of the list we'll actually iterate over
-        log_verbose(f"Performing semantic search across {total_collections_to_search} collections...")
-        reinit_msg = f"Client re-initialization is ENABLED (every {CLIENT_REINIT_INTERVAL} collections)." if ENABLE_CLIENT_REINIT else "Client re-initialization is DISABLED."
-        log_verbose(reinit_msg)
-        log_verbose(f"Retrieving up to {args.num_results_per_coll} chunks per collection.") # Use new arg name
-        log_verbose(f"Maintaining top {args.max_context_docs} unique docs overall.")
-        query_embedding = st_ef([core_doc])[0] # Embed core doc once
+        # 2. Get a Random Starting Point (from the *sampled* collections for this attempt)
+        core_id = None
+        core_doc = None
+        core_meta = None
+        selected_collection_name = None
+        MAX_START_DOC_ATTEMPTS = 10 # Try up to 10 times within the sampled set
+        start_doc_attempts = 0
+        # Use a copy of the *sampled* list for attempts
+        attempt_collection_list = sampled_collections_for_this_attempt.copy()
 
-        # --- Use the potentially sampled list for the loop ---
-        for idx, collection_name in enumerate(collections_to_search):
-            # --- Optional Periodic Re-initialization ---
-            if ENABLE_CLIENT_REINIT and idx > 0 and idx % CLIENT_REINIT_INTERVAL == 0:
-                client, st_ef, query_embedding = reinitialize_chromadb_client(
-                    client, st_ef, args, core_doc
-                )
-            # --- End Optional Periodic Re-initialization ---
-
-            # --- Calculate Elapsed Time ---
-            current_time = datetime.datetime.now()
-            elapsed_time = current_time - start_time
-            total_seconds = int(elapsed_time.total_seconds())
-            hours, remainder = divmod(total_seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            elapsed_str = f"{hours:02}:{minutes:02}:{seconds:02}"
-            # --- End Calculate Elapsed Time ---
-
-            percentage = (idx + 1) / total_collections_to_search * 100 # Use total_collections_to_search here
-            # --- Update Progress Indicator with Time and Found Count ---
-            progress_line = f"\rSearching collection {idx + 1}/{total_collections_to_search} ({percentage:.1f}%) | Found: {len(top_results_heap)}/{args.max_context_docs} | Elapsed: {elapsed_str}..."
-            print(progress_line, end='')
-            # --- End Update Progress Indicator ---
-
+        log_verbose(f"Attempting to select a random starting document from {len(attempt_collection_list)} sampled collections (max {MAX_START_DOC_ATTEMPTS} attempts)...")
+        while start_doc_attempts < MAX_START_DOC_ATTEMPTS:
+            start_doc_attempts += 1
+            log_verbose(f"Start doc attempt {start_doc_attempts}/{MAX_START_DOC_ATTEMPTS}...")
             try:
-                # Use the potentially re-initialized client and st_ef
-                collection = client.get_collection(name=collection_name, embedding_function=st_ef)
-                search_result = collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=args.num_results_per_coll, # Use new arg name here
-                    include=['documents', 'metadatas', 'distances']
-                )
+                if not attempt_collection_list:
+                     log_verbose("Warning: Ran out of sampled collections to attempt for starting document in this pipeline attempt.")
+                     break # Exit inner loop, will fail core_doc check below
 
-                # --- Process results using heapq ---
-                if search_result and search_result.get('ids') and search_result['ids'][0]:
-                    for i in range(len(search_result['ids'][0])):
-                        distance = search_result['distances'][0][i]
-                        document = search_result['documents'][0][i]
-                        metadata = search_result['metadatas'][0][i] if search_result['metadatas'] else {}
-                        doc_hash = hash(document)
+                random_collection_name = random.choice(attempt_collection_list)
+                log_verbose(f"Trying collection: {random_collection_name}")
 
-                        if doc_hash in processed_doc_hashes:
-                            continue
+                try: collection = client.get_collection(name=random_collection_name, embedding_function=st_ef)
+                except Exception as e:
+                     print(f"Warning: Sampled collection '{random_collection_name}' unexpectedly failed to load: {e}. Removing from attempts.")
+                     attempt_collection_list.remove(random_collection_name)
+                     continue
 
-                        result_item = {
-                            "id": search_result['ids'][0][i],
-                            "document": document,
-                            "distance": distance,
-                            "metadata": metadata,
-                            "collection": collection_name
-                        }
+                results = collection.get(limit=10, include=['documents', 'metadatas'])
+                if not results or not results.get('ids'):
+                    log_verbose(f"Warning: Collection {random_collection_name} exists but appears empty. Removing from attempts.")
+                    attempt_collection_list.remove(random_collection_name)
+                    continue
 
-                        # --- Enhanced Reporting Logic ---
-                        new_top_chunk_found = False
-                        if len(top_results_heap) < args.max_context_docs:
-                            heapq.heappush(top_results_heap, (-distance, result_item))
-                            processed_doc_hashes.add(doc_hash)
-                            # Check if the heap just became full
-                            if len(top_results_heap) == args.max_context_docs:
-                                new_top_chunk_found = True # The Nth item was just added
-                        elif distance < -top_results_heap[0][0]:
-                            removed_item = heapq.heapreplace(top_results_heap, (-distance, result_item))
-                            processed_doc_hashes.remove(hash(removed_item[1]['document']))
-                            processed_doc_hashes.add(doc_hash)
-                            new_top_chunk_found = True # An existing item was replaced
-
-                        if new_top_chunk_found:
-                            # Clear the progress line, print the notification, then reprint progress
-                            print(f"\r{' ' * 120}\r", end='') # Clear ample space
-                            source_file = metadata.get('filename', 'N/A')
-                            print(f"Found new top chunk (Dist: {distance:.4f}, File: {source_file})")
-                            # Reprint the latest progress line
-                            progress_line = f"\rSearching collection {idx + 1}/{total_collections_to_search} ({percentage:.1f}%) | Found: {len(top_results_heap)}/{args.max_context_docs} | Elapsed: {elapsed_str}..."
-                            print(progress_line, end='')
-                        # --- End Enhanced Reporting Logic ---
+                random_index = random.choice(range(len(results['ids'])))
+                core_id = results['ids'][random_index]
+                core_doc = results['documents'][random_index]
+                core_meta = results['metadatas'][random_index] if results['metadatas'] else {}
+                selected_collection_name = random_collection_name
+                log_verbose(f"Selected core document ID: {core_id} from collection {selected_collection_name} (Source File: {core_meta.get('filename', 'N/A')})")
+                log_verbose(f"Core document content (start): {core_doc[:200]}...")
+                break # Exit inner loop successfully
 
             except Exception as e:
-                print(f"\r{' ' * 120}\r", end='') # Clear ample space
-                log_verbose(f"Could not query collection {collection_name}: {e}")
+                print(f"Unexpected error during starting document selection (Attempt {start_doc_attempts}): {e}")
+                if random_collection_name in attempt_collection_list: attempt_collection_list.remove(random_collection_name)
+                time.sleep(1)
                 continue
 
-        print() # Newline after loop
+        if not core_doc:
+            print(f"Error: Failed to find a valid starting document in sampled collections for pipeline attempt {pipeline_attempt}. Trying next attempt.")
+            continue # Go to the next iteration of the outer pipeline loop
 
-        # Extract the documents from the heap, sort by actual distance (ascending)
-        # The heap stores (-distance, item), so sort by -heap_item[0]
-        final_top_results = sorted([item[1] for item in top_results_heap], key=lambda x: x['distance'])
+        # 3. Semantic Context Retrieval (from the *sampled* collections for this attempt)
+        top_results_heap = []
+        processed_doc_hashes = {hash(core_doc)}
 
-        # Construct the final context, ensuring the core_doc is first
-        final_context_docs = [core_doc]
-        # Add other top results, skipping the core_doc if it was found again
-        for result in final_top_results:
-             if result['document'] != core_doc:
-                 final_context_docs.append(result['document'])
-             # Ensure we don't exceed max_context_docs just in case core_doc wasn't in top N
-             if len(final_context_docs) >= args.max_context_docs:
-                 break
+        try:
+            total_collections_to_search = len(sampled_collections_for_this_attempt) # Use the length of the sampled list
+            log_verbose(f"Performing semantic search across {total_collections_to_search} sampled collections...")
+            reinit_msg = f"Client re-initialization is ENABLED (every {CLIENT_REINIT_INTERVAL} collections)." if ENABLE_CLIENT_REINIT else "Client re-initialization is DISABLED."
+            log_verbose(reinit_msg)
+            log_verbose(f"Retrieving up to {args.num_results_per_coll} chunks per collection.")
+            log_verbose(f"Maintaining top {args.max_context_docs} unique docs overall.")
+            query_embedding = st_ef([core_doc])[0]
 
-        combined_context = "\n\n---\n\n".join(final_context_docs)
-        log_verbose(f"Combined context includes {len(final_context_docs)} unique document chunks (Top {args.max_context_docs} including core doc).")
-        log_verbose(f"Combined context (start): {combined_context[:300]}...")
+            # --- Use the sampled list for the loop ---
+            for idx, collection_name in enumerate(sampled_collections_for_this_attempt):
+                # --- Optional Periodic Re-initialization ---
+                if ENABLE_CLIENT_REINIT and idx > 0 and idx % CLIENT_REINIT_INTERVAL == 0:
+                    client, st_ef, query_embedding = reinitialize_chromadb_client(
+                        client, st_ef, args, core_doc
+                    )
+                # --- End Optional Periodic Re-initialization ---
 
-    except Exception as e:
-        print(f"Error during multi-collection semantic search: {e}")
-        exit(1)
+                # --- Calculate Elapsed Time ---
+                current_time = datetime.datetime.now()
+                elapsed_time = current_time - start_time
+                total_seconds = int(elapsed_time.total_seconds())
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                elapsed_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+                # --- End Calculate Elapsed Time ---
 
-    # --- LLM Pipeline ---
+                percentage = (idx + 1) / total_collections_to_search * 100
+                # --- Update Progress Indicator ---
+                progress_line = f"\rSearching collection {idx + 1}/{total_collections_to_search} ({percentage:.1f}%) | Found: {len(top_results_heap)}/{args.max_context_docs} | Elapsed: {elapsed_str}..."
+                print(progress_line, end='')
+                # --- End Update Progress Indicator ---
 
-    # 4. Context Validation (LLM Call #1)
-    print("\nStep 1: Validating Context...")
-    validation_prompt = CONTEXT_VALIDATION_PROMPT_TEMPLATE.format(context=combined_context)
-    validation_result = call_llm(validation_prompt, CONTEXT_VALIDATION_SYSTEM_PROMPT)
+                try:
+                    collection = client.get_collection(name=collection_name, embedding_function=st_ef)
+                    search_result = collection.query(
+                        query_embeddings=[query_embedding],
+                        n_results=args.num_results_per_coll, # Use updated default (3)
+                        include=['documents', 'metadatas', 'distances']
+                    )
 
-    if not validation_result:
-        print("Failed to get context validation result from LLM.")
-        exit(1)
-    print(f"Context Validation Result: {validation_result}")
-    if not validation_result.lower().startswith("sufficient"):
-        print("Context deemed insufficient. Skipping generation for this document.")
-        exit(0) # Exit gracefully, try again with a different random doc next time
+                    # --- Process results using heapq ---
+                    # ... (heap processing and notification logic remains the same) ...
+                    if search_result and search_result.get('ids') and search_result['ids'][0]:
+                        for i in range(len(search_result['ids'][0])):
+                            distance = search_result['distances'][0][i]
+                            document = search_result['documents'][0][i]
+                            metadata = search_result['metadatas'][0][i] if search_result['metadatas'] else {}
+                            doc_hash = hash(document)
 
-    # 5. Interpret and Explain (LLM Call #2)
-    print("\nStep 2: Interpreting Script and Generating Explanation...")
-    interpretation_prompt = INTERPRETATION_PROMPT_TEMPLATE.format(context=combined_context)
-    explanation = call_llm(interpretation_prompt, INTERPRETATION_SYSTEM_PROMPT)
+                            if doc_hash in processed_doc_hashes: continue
 
-    if not explanation:
-        print("Failed to get explanation from LLM.")
-        exit(1)
-    log_verbose(f"Generated Explanation:\n{explanation}")
+                            result_item = { "id": search_result['ids'][0][i], "document": document, "distance": distance, "metadata": metadata, "collection": collection_name }
 
-    # 6. Explanation Review (LLM Call #3)
-    print("\nStep 3: Reviewing Explanation...")
-    review_prompt = EXPLANATION_REVIEW_PROMPT_TEMPLATE.format(
-        script_context=combined_context,
-        explanation=explanation
-    )
-    explanation_review = call_llm(review_prompt, EXPLANATION_REVIEW_SYSTEM_PROMPT)
+                            new_top_chunk_found = False
+                            if len(top_results_heap) < args.max_context_docs:
+                                heapq.heappush(top_results_heap, (-distance, result_item))
+                                processed_doc_hashes.add(doc_hash)
+                                if len(top_results_heap) == args.max_context_docs: new_top_chunk_found = True
+                            elif distance < -top_results_heap[0][0]:
+                                removed_item = heapq.heapreplace(top_results_heap, (-distance, result_item))
+                                processed_doc_hashes.remove(hash(removed_item[1]['document']))
+                                processed_doc_hashes.add(doc_hash)
+                                new_top_chunk_found = True
 
-    if not explanation_review:
-        print("Failed to get explanation review from LLM.")
-        exit(1)
-    print(f"Explanation Review Result: {explanation_review}")
-    if not explanation_review.lower().startswith("clear and accurate"):
-        print("Explanation failed review. Skipping Q&A generation.")
-        exit(0)
+                            if new_top_chunk_found:
+                                print(f"\r{' ' * 120}\r", end='')
+                                source_file = metadata.get('filename', 'N/A')
+                                print(f"Found new top chunk (Dist: {distance:.4f}, File: {source_file})")
+                                progress_line = f"\rSearching collection {idx + 1}/{total_collections_to_search} ({percentage:.1f}%) | Found: {len(top_results_heap)}/{args.max_context_docs} | Elapsed: {elapsed_str}..."
+                                print(progress_line, end='')
+                    # --- End Process results ---
 
-    # 7. Generate Q&A (LLM Call #4)
-    print("\nStep 4: Generating Question & Answer Pair...")
-    qa_gen_prompt = QA_GENERATION_PROMPT_TEMPLATE.format(explanation=explanation)
-    qa_json_str = call_llm(qa_gen_prompt, QA_GENERATION_SYSTEM_PROMPT)
+                except Exception as e:
+                    print(f"\r{' ' * 120}\r", end='')
+                    log_verbose(f"Could not query collection {collection_name}: {e}")
+                    continue
 
-    if not qa_json_str:
-        print("Failed to get Q&A JSON from LLM.")
-        exit(1)
+            print() # Newline after loop
 
-    try:
-        # Clean potential markdown code fences
-        if qa_json_str.startswith("```json"):
-            qa_json_str = qa_json_str[7:]
-        if qa_json_str.endswith("```"):
-            qa_json_str = qa_json_str[:-3]
-        qa_pair = json.loads(qa_json_str.strip())
-        if "question" not in qa_pair or "answer" not in qa_pair:
-            raise ValueError("Generated JSON missing 'question' or 'answer' key.")
-        log_verbose(f"Generated Q&A: {qa_pair}")
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON from LLM for Q&A generation: {e}")
-        print(f"LLM Output was: {qa_json_str}")
-        exit(1)
-    except ValueError as e:
-        print(f"Error in generated Q&A JSON structure: {e}")
-        print(f"LLM Output was: {qa_json_str}")
-        exit(1)
+            # --- Extract and Dynamically Determine Threshold ---
+            # ... (knee point detection logic remains the same) ...
+            final_top_results_sorted = sorted([item[1] for item in top_results_heap], key=lambda x: x['distance'])
+            dynamic_distance_threshold = 1.5
+            if len(final_top_results_sorted) >= 3:
+                log_verbose(f"Attempting to find knee point in {len(final_top_results_sorted)} sorted distances...")
+                distances = [r['distance'] for r in final_top_results_sorted]
+                indices = list(range(len(distances)))
+                try:
+                    kneedle = KneeLocator(indices, distances, curve='convex', direction='increasing', S=1.0)
+                    if kneedle.knee is not None:
+                        knee_index = kneedle.knee
+                        dynamic_distance_threshold = distances[knee_index]
+                        log_verbose(f"Found knee point at index {knee_index} with distance: {dynamic_distance_threshold:.4f}")
+                    else: log_verbose("Could not find a distinct knee point. Using default threshold.")
+                except Exception as e: log_verbose(f"Error during knee point detection: {e}. Using default threshold.")
+            else: log_verbose(f"Too few results ({len(final_top_results_sorted)}) to determine knee point. Using default threshold.")
 
-    # 8. Q&A Quality/Relevance Review (LLM Call #5)
-    print("\nStep 5: Reviewing Q&A Pair...")
-    qa_review_prompt = QA_REVIEW_PROMPT_TEMPLATE.format(
-        explanation=explanation,
-        question=qa_pair["question"],
-        answer=qa_pair["answer"]
-    )
-    qa_review = call_llm(qa_review_prompt, QA_REVIEW_SYSTEM_PROMPT)
+            # --- Filter Final Results using Dynamic Threshold ---
+            # ... (filtering logic remains the same) ...
+            final_context_docs = [core_doc]
+            docs_added_count = 1
+            log_verbose(f"Filtering {len(final_top_results_sorted)} potential context chunks by dynamic distance <= {dynamic_distance_threshold:.4f}...")
+            for result in final_top_results_sorted:
+                 if docs_added_count >= args.max_context_docs:
+                     log_verbose(f"Reached max context docs ({args.max_context_docs}).")
+                     break
+                 if result['document'] == core_doc: continue
+                 if result['distance'] <= dynamic_distance_threshold:
+                     final_context_docs.append(result['document'])
+                     docs_added_count += 1
+                 else:
+                     log_verbose(f"Stopping filter: Next chunk distance ({result['distance']:.4f}) exceeds dynamic threshold ({dynamic_distance_threshold:.4f}).")
+                     break
+            combined_context = "\n\n---\n\n".join(final_context_docs)
+            log_verbose(f"Combined context includes {len(final_context_docs)} unique document chunks after filtering.")
+            log_verbose(f"Combined context (start): {combined_context[:300]}...")
+            # --- End Extract and Filter Final Results ---
 
-    if not qa_review:
-        print("Failed to get Q&A review from LLM.")
-        exit(1)
-    print(f"Q&A Review Result: {qa_review}")
+        except Exception as e:
+            print(f"Error during multi-collection semantic search for attempt {pipeline_attempt}: {e}")
+            continue # Go to the next iteration of the outer pipeline loop
 
-    # 9. Output
-    if qa_review.lower().startswith("high quality"):
-        print("\n--- Generated High-Quality Q&A Pair ---")
-        # Print the final JSON object to stdout
-        print(json.dumps(qa_pair, indent=2))
-        print("--- End of Pair ---")
-    else:
-        print("\nQ&A pair failed quality review. Discarding.")
-        exit(0) # Exit gracefully, pair wasn't good enough
+        # --- LLM Pipeline ---
+        try:
+            # 4. Context Validation (LLM Call #1)
+            print("\nStep 1: Validating Context...")
+            validation_prompt = CONTEXT_VALIDATION_PROMPT_TEMPLATE.format(context=combined_context)
+            validation_result = call_llm(validation_prompt, CONTEXT_VALIDATION_SYSTEM_PROMPT)
+            if not validation_result: raise ValueError("Failed to get context validation result from LLM.")
+            print(f"Context Validation Result: {validation_result}")
+            if not validation_result.lower().startswith("sufficient"):
+                print("Context deemed insufficient. Trying next pipeline attempt.")
+                continue # Go to the next iteration of the outer pipeline loop
+
+            # 5. Interpret and Explain (LLM Call #2)
+            print("\nStep 2: Interpreting Script and Generating Explanation...")
+            interpretation_prompt = INTERPRETATION_PROMPT_TEMPLATE.format(context=combined_context)
+            explanation = call_llm(interpretation_prompt, INTERPRETATION_SYSTEM_PROMPT)
+            if not explanation: raise ValueError("Failed to get explanation from LLM.")
+            log_verbose(f"Generated Explanation:\n{explanation}")
+
+            # 6. Explanation Review (LLM Call #3)
+            print("\nStep 3: Reviewing Explanation...")
+            review_prompt = EXPLANATION_REVIEW_PROMPT_TEMPLATE.format(script_context=combined_context, explanation=explanation)
+            explanation_review = call_llm(review_prompt, EXPLANATION_REVIEW_SYSTEM_PROMPT)
+            if not explanation_review: raise ValueError("Failed to get explanation review from LLM.")
+            print(f"Explanation Review Result: {explanation_review}")
+            if not explanation_review.lower().startswith("clear and accurate"):
+                print("Explanation failed review. Trying next pipeline attempt.")
+                continue # Go to the next iteration of the outer pipeline loop
+
+            # 7. Generate Q&A (LLM Call #4)
+            print("\nStep 4: Generating Question & Answer Pair...")
+            qa_gen_prompt = QA_GENERATION_PROMPT_TEMPLATE.format(explanation=explanation)
+            qa_json_str = call_llm(qa_gen_prompt, QA_GENERATION_SYSTEM_PROMPT)
+            if not qa_json_str: raise ValueError("Failed to get Q&A JSON from LLM.")
+            try:
+                if qa_json_str.startswith("```json"): qa_json_str = qa_json_str[7:]
+                if qa_json_str.endswith("```"): qa_json_str = qa_json_str[:-3]
+                qa_pair = json.loads(qa_json_str.strip())
+                if "question" not in qa_pair or "answer" not in qa_pair: raise ValueError("Generated JSON missing 'question' or 'answer' key.")
+                log_verbose(f"Generated Q&A: {qa_pair}")
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"Error processing generated Q&A JSON: {e}")
+                print(f"LLM Output was: {qa_json_str}")
+                raise ValueError("Failed to process Q&A JSON.") # Raise to trigger outer loop retry
+
+            # 8. Q&A Quality/Relevance Review (LLM Call #5)
+            print("\nStep 5: Reviewing Q&A Pair...")
+            qa_review_prompt = QA_REVIEW_PROMPT_TEMPLATE.format(explanation=explanation, question=qa_pair["question"], answer=qa_pair["answer"])
+            qa_review = call_llm(qa_review_prompt, QA_REVIEW_SYSTEM_PROMPT)
+            if not qa_review: raise ValueError("Failed to get Q&A review from LLM.")
+            print(f"Q&A Review Result: {qa_review}")
+
+            # 9. Output and Save (Success!)
+            if qa_review.lower().startswith("high quality"):
+                print("\n--- Generated High-Quality Q&A Pair ---")
+                print(json.dumps(qa_pair, indent=2))
+                print("--- End of Pair ---")
+
+                # --- Append to JSON file ---
+                try:
+                    output_filename = "ck3_qa_pairs.jsonl"
+                    with open(output_filename, 'a', encoding='utf-8') as f:
+                        # Write the JSON object as a single line
+                        json.dump(qa_pair, f, ensure_ascii=False)
+                        f.write('\n') # Add a newline to separate JSON objects (JSON Lines format)
+                    print(f"Successfully appended Q&A pair to {output_filename}")
+                except Exception as e:
+                    print(f"Error writing Q&A pair to file '{output_filename}': {e}")
+                # --- End Append to JSON file ---
+
+                success = True # Set success flag
+                break # Exit the while pipeline_attempt loop
+            else:
+                print("\nQ&A pair failed quality review. Trying next pipeline attempt.")
+                continue # Go to the next iteration of the outer pipeline loop
+
+        except Exception as llm_pipeline_error:
+             # Catch errors during the LLM steps (including failed calls returning None)
+             print(f"Error during LLM pipeline (Attempt {pipeline_attempt}): {llm_pipeline_error}")
+             # Continue to the next iteration of the outer loop
+             continue
+
+    # --- After the Loop ---
+    if not success: # Check the success flag
+         print(f"\nFailed to generate a high-quality Q&A pair after {MAX_PIPELINE_ATTEMPTS} attempts.")
 
     # --- End Timer ---
     end_time = datetime.datetime.now()
